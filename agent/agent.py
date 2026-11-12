@@ -5,10 +5,16 @@ Runs on the Runner with NO third-party dependencies. All communication is
 outbound to the Oracle server:
     register -> heartbeat/pull loop -> execute task -> report result
 
-Config:     config.json (oracle_url, agent_name, capabilities, ...)
+Concurrency model (v0.2):
+    pull-loop 主线程只做 pull + heartbeat + 提交；execute 跑在
+    ThreadPoolExecutor (max_workers = max_concurrent, 默认 32, 0=无界)
+    里，支持同时跑 N 条任务，sleep / 长任务不会阻塞后续命令。
+
+Config:     config.json (oracle_url, agent_name, capabilities, max_concurrent, ...)
 State:      state.json (agent_id + token, created on first register, chmod 600)
 Run:        python3 agent.py
 """
+import concurrent.futures
 import json
 import os
 import re
@@ -16,7 +22,10 @@ import secrets
 import signal
 import socket
 import sys
+import threading
 import time
+import http.client
+import ssl
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -33,15 +42,95 @@ STATE_PATH = BASE_DIR / "state.json"
 
 CONFIG = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
 ORACLE_URL = (CONFIG.get("oracle_url") or "").rstrip("/")
-PULL_TIMEOUT = int(CONFIG.get("pull_timeout_sec", 30))
+PULL_TIMEOUT = int(CONFIG.get("pull_timeout_sec", 60))
 HEARTBEAT_INTERVAL = int(CONFIG.get("heartbeat_interval_sec", 60))
 USER_AGENT = CONFIG.get("user_agent") or ("oracle-agent/" + str(CONFIG.get("version", "0.1.0")))
+
+# 并发上限：max_concurrent=0 表示无界（每个任务一个线程）；>0 则作为线程池上限。
+# 默认 32，对 runner 足够；设 0 则彻底无界。
+MAX_CONCURRENT = int(CONFIG.get("max_concurrent", 32))
 
 AGENT_ID = None
 TOKEN = None
 STOP = False
 _pty_sessions = {}  # session_id -> state dict
 _ws_client = None   # global WSClient instance
+
+# ── keep-alive 连接池 ──
+_pull_conn = None   # 长轮询专用（held open up to 60s）
+_cmd_conn = None    # 注册 / 上报结果 / heartbeat 专用
+
+
+class KeepAliveConn:
+    """持久 HTTPS 连接，keep-alive 复用，断了自动重连。"""
+
+    def __init__(self, base_url: str):
+        from urllib.parse import urlparse as _up
+        parsed = _up(base_url)
+        self.scheme = parsed.scheme or "https"
+        self.host = parsed.hostname
+        self.port = parsed.port or (443 if self.scheme == "https" else 80)
+        self.base_path = parsed.path.rstrip("/")
+        self._conn = None
+
+    def _ensure(self):
+        if self._conn is not None:
+            return
+        if self.scheme == "https":
+            ctx = ssl.create_default_context()
+            self._conn = http.client.HTTPSConnection(self.host, self.port, context=ctx)
+        else:
+            self._conn = http.client.HTTPConnection(self.host, self.port)
+
+    def _close(self):
+        if self._conn:
+            try: self._conn.close()
+            except Exception: pass
+            self._conn = None
+
+    def request(self, method: str, path: str, body: dict | None = None,
+                headers: dict | None = None, timeout: float = 30) -> dict:
+        """发请求，返回 JSON dict。连接断了自动重连重试一次。"""
+        full_path = self.base_path + path
+        h = {"Connection": "keep-alive", "User-Agent": USER_AGENT}
+        if headers:
+            h.update(headers)
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            h["Content-Type"] = "application/json"
+            h["Content-Length"] = str(len(data))
+
+        for attempt in range(2):
+            try:
+                self._ensure()
+                self._conn.timeout = timeout
+                self._conn.request(method, full_path, body=data, headers=h)
+                resp = self._conn.getresponse()
+                raw = resp.read()
+                if resp.status >= 400:
+                    try:
+                        detail = json.loads(raw.decode("utf-8"))
+                    except Exception:
+                        detail = {"message": raw.decode("utf-8", "replace")}
+                    raise AgentHTTPError(resp.status, detail)
+                return json.loads(raw.decode("utf-8")) if raw else {}
+            except AgentHTTPError:
+                raise
+            except (http.client.HTTPException, OSError, ConnectionError, TimeoutError) as e:
+                self._close()
+                if attempt == 0:
+                    continue  # retry once
+                raise AgentHTTPError(0, {"message": f"network error: {e}"}) from e
+
+    def close(self):
+        self._close()
+
+# 共享 ThreadPoolExecutor: 0 => 无界, 用 threading.Thread per task
+_executor: "concurrent.futures.ThreadPoolExecutor | None" = None
+_executor_lock = threading.Lock()
+_active_tasks: set = set()  # 正在跑的任务 task_id（用于日志统计）
+_active_lock = threading.Lock()
 
 
 def log(msg: str) -> None:
@@ -56,29 +145,16 @@ class AgentHTTPError(Exception):
         self.detail = detail
 
 
-def _request(path: str, body: dict, token: str | None = None, timeout: float = 30):
-    url = ORACLE_URL + path
-    data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method="POST",
-        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
-    )
+def _request(path: str, body: dict, token: str | None = None,
+               timeout: float = 30, conn=None):
+    """通过 KeepAliveConn 发 POST 请求。conn=None 时用 _cmd_conn。"""
+    c = conn or _cmd_conn
+    if c is None:
+        raise AgentHTTPError(0, {"message": "no connection initialized"})
+    headers = {}
     if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        try:
-            detail = json.loads(e.read().decode("utf-8"))
-        except Exception:
-            detail = {"message": str(e)}
-        raise AgentHTTPError(e.code, detail) from e
-    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as e:
-        # 网络/超时错误必须转成可重试错误，否则会炸掉主循环被 systemd 反复拉起
-        raise AgentHTTPError(0, {"message": f"network error: {e}"}) from e
+        headers["Authorization"] = f"Bearer {token}"
+    return c.request("POST", path, body=body, headers=headers, timeout=timeout)
 
 
 def load_state() -> dict:
@@ -130,8 +206,6 @@ def public_ip() -> str:
 
 
 def default_agent_id() -> str:
-    # GitHub 会复用 VM 主机名；纯 hostname 做 agent_id 会与历史记录碰撞(403)。
-    # 优先用 Azure VM instance ID（全局唯一、稳定）做唯一性来源，取不到再回退随机后缀。
     host = re.sub(r"[^A-Za-z0-9._-]", "-", socket.gethostname() or "unknown")
     vm = str(azure_metadata().get("compute", {}).get("vmId") or "")
     uniq = vm[:8] if vm else secrets.token_hex(3)
@@ -158,11 +232,14 @@ def register() -> tuple[str, str]:
             "imds": imds,
         },
     }
+    # register 在连接初始化之前，临时创建一个
+    global _cmd_conn
+    if _cmd_conn is None:
+        _cmd_conn = KeepAliveConn(ORACLE_URL)
     try:
         resp = _request("/api/v1/agent/register", body, timeout=15)
     except AgentHTTPError as e:
         if e.code == 403 and "agent_id already exists" in str(e.detail):
-            # id 碰撞（主机名复用等）：换一个新 id 重试
             fresh = f"{default_agent_id()}"
             log(f"agent_id collision; re-registering as {fresh} ({e})")
             body["agent_id"] = fresh
@@ -196,6 +273,7 @@ def pull() -> dict:
         {"agent_id": AGENT_ID, "timeout_sec": PULL_TIMEOUT},
         token=TOKEN,
         timeout=PULL_TIMEOUT + 10,
+        conn=_pull_conn,
     )
 
 
@@ -212,7 +290,7 @@ def execute(task: dict) -> tuple[str, dict | None, str | None]:
         return "timeout", e.output, e.message
     except HandlerError as e:
         return e.status, e.output, e.message
-    except Exception as e:  # defensive: never let one bad task kill the loop
+    except Exception as e:
         return "failed", None, f"{type(e).__name__}: {e}"
 
 
@@ -256,7 +334,6 @@ def _signal_handler(signum, _frame) -> None:
     log(f"received signal {signum}, stopping gracefully")
 
 
-
 def _on_ws_message(msg: dict):
     """Handle messages from server via WebSocket."""
     msg_type = msg.get("type")
@@ -270,7 +347,6 @@ def _on_ws_message(msg: dict):
             if state:
                 _pty_sessions[session_id] = state
         else:
-            # Non-PTY exec via WS: run and send result back
             import subprocess
             timeout = msg.get("timeout_sec", 60)
             try:
@@ -319,6 +395,50 @@ def _start_ws_client():
     return client
 
 
+# ---------------------------------------------------------------------------
+# 并发执行：pull-loop 主线程不阻塞，execute 跑在 worker 里
+# ---------------------------------------------------------------------------
+
+def _execute_and_report(task: dict) -> None:
+    """Worker 线程: 跑一个任务并回报结果（异常兜底，不影响其他任务）。"""
+    task_id = task.get("task_id", "?")
+    type_ = task.get("type")
+    with _active_lock:
+        _active_tasks.add(task_id)
+        log(f"task {task_id[:12]} type={type_} start (in-flight={len(_active_tasks)})")
+    started_at = datetime.now(timezone.utc).isoformat()
+    try:
+        status, output, error = execute(task)
+    except Exception as e:
+        status, output, error = "failed", None, f"{type(e).__name__}: {e}"
+    finished_at = datetime.now(timezone.utc).isoformat()
+    try:
+        report_result(task_id, status, output, error, started_at, finished_at)
+        log(f"task {task_id[:12]} -> {status}")
+    except AgentHTTPError as e:
+        log(f"task {task_id[:12]} report failed: {e}")
+    finally:
+        with _active_lock:
+            _active_tasks.discard(task_id)
+
+
+def _submit(task: dict) -> None:
+    """把任务提交到线程池 / 新线程（无界模式）。"""
+    global _executor
+    if MAX_CONCURRENT <= 0:
+        # 无界：每个任务开一个线程
+        t = threading.Thread(target=_execute_and_report, args=(task,), daemon=True)
+        t.start()
+        return
+    with _executor_lock:
+        if _executor is None:
+            _executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=MAX_CONCURRENT,
+                thread_name_prefix="oracle-task",
+            )
+        _executor.submit(_execute_and_report, task)
+
+
 def main() -> int:
     global AGENT_ID, TOKEN, STOP
     signal.signal(signal.SIGTERM, _signal_handler)
@@ -328,7 +448,6 @@ def main() -> int:
         log("error: config.json missing or oracle_url empty")
         return 1
 
-    # Register (or re-register) once at startup.
     for attempt in range(1, 6):
         try:
             AGENT_ID, TOKEN = register()
@@ -341,23 +460,14 @@ def main() -> int:
         return 1
     log(f"registered as {AGENT_ID}")
 
-    last_heartbeat = 0.0
-    ws = None  # WS client not yet wired up; fall back to pull loop
+    # 初始化 keep-alive 连接
+    global _pull_conn, _cmd_conn
+    _cmd_conn = KeepAliveConn(ORACLE_URL)
+    _pull_conn = KeepAliveConn(ORACLE_URL)
+
+    ws = None
     while not STOP:
-        now = time.time()
-        if now - last_heartbeat >= HEARTBEAT_INTERVAL:
-            try:
-                heartbeat()
-                last_heartbeat = now
-            except AgentHTTPError as e:
-                log(f"heartbeat failed: {e}")
-
-        # If WS is connected, skip pull (WS handles task dispatch)
-        if ws and ws.is_connected():
-            time.sleep(1)
-            continue
-
-        # WS disconnected: fall back to pull loop
+        # pull 即心跳：长轮询 60s，server 收到请求就知道 runner 在线
         try:
             resp = pull()
         except AgentHTTPError as e:
@@ -369,16 +479,21 @@ def main() -> int:
         if not task:
             continue
 
-        task_id = task.get("task_id", "?")
-        log(f"task {task_id[:12]} type={task.get('type')} started")
-        started_at = datetime.now(timezone.utc).isoformat()
-        status, output, error = execute(task)
-        finished_at = datetime.now(timezone.utc).isoformat()
-        try:
-            report_result(task_id, status, output, error, started_at, finished_at)
-            log(f"task {task_id[:12]} -> {status}")
-        except AgentHTTPError as e:
-            log(f"report failed: {e}")
+        _submit(task)  # 非阻塞提交；execute 在 worker 里跑，主循环继续 pull
+
+    # 优雅退出：等所有 in-flight 任务完成（最多 10s）
+    with _active_lock:
+        remaining = len(_active_tasks)
+    if remaining:
+        log(f"waiting for {remaining} in-flight task(s) to finish...")
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            with _active_lock:
+                if not _active_tasks:
+                    break
+            time.sleep(0.5)
+    if _executor is not None:
+        _executor.shutdown(wait=False)
 
     log("agent stopped")
     return 0
